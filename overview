@@ -1,0 +1,159 @@
+aStuff+ v1 Code
+
+import pandas as pd
+import numpy as np
+import xgboost as xgb
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import mean_squared_error
+import matplotlib.pyplot as plt
+from hyperopt import fmin, tpe, hp, Trials, STATUS_OK
+
+# I have pitch-by-pitch Statcast data saved as CSV files, acquired from Pybaseball package
+
+df_2021=pd.read_csv('2021 Data')
+
+df_2022=pd.read_csv('2022 Data')
+
+df_2023=pd.read_csv('2023 Data')
+
+df = pd.concat([df_2021, df_2022, df_2023], ignore_index=True)
+
+redefinitions = {
+    'swinging_strike_blocked': 'swinging_strike',
+    'missed_bunt': 'swinging_strike',
+    'foul_tip': 'swinging_strike',
+    'blocked_ball': 'ball',
+    'hit_by_pitch': 'ball',
+    'foul_bunt': 'foul',
+    'bunt_foul_tip': 'foul',
+    'foul_pitchout': 'foul'
+}
+
+df['description'] = df['description'].replace(redefinitions)
+
+print(df['description'].value_counts())
+
+df['count'] = df['balls'].astype(str) + '-' + df['strikes'].astype(str)
+
+df['outcome'] = np.where(df['description'] == 'hit_into_play', df['events'], df['description'])
+
+hit_into_play_categories = {
+    'single': 'single',
+    'double': 'double',
+    'triple': 'triple',
+    'home_run': 'home_run'
+}
+
+df['outcome'] = df['outcome'].replace(hit_into_play_categories).fillna('out')
+
+avg_run_values = df.groupby(['count', 'p_throws', 'stand', 'outcome'])['delta_run_exp'].mean().reset_index(name='avg_run_value')
+
+print(avg_run_values.head())
+
+avg_run_values = df.groupby(['count', 'p_throws', 'stand', 'outcome'])['delta_run_exp'].mean().reset_index(name='avg_run_value')
+
+df = df.merge(avg_run_values, how='left', on=['count', 'p_throws', 'stand', 'outcome'])
+
+df.replace([np.inf, -np.inf], np.nan, inplace=True)
+
+df.dropna(subset=['avg_run_value', 'release_speed', 'release_pos_x', 'release_pos_z', 'pfx_x', 'pfx_z', 'release_spin_rate', 'release_extension', 'spin_axis'], inplace=True)
+
+df['adjusted_release_pos_x'] = np.where(df['p_throws'] == 'L', -df['release_pos_x'], df['release_pos_x'])
+
+df['adjusted_pfx_x'] = np.where(df['p_throws'] == 'L', -df['pfx_x'], df['pfx_x'])
+
+df['adjusted_spin_axis'] = np.where(df['p_throws'] == 'L', 360 - df['spin_axis'], df['spin_axis'])
+
+fastballs = df[df['pitch_type'].isin(['FF', 'SI', 'FC'])]
+
+primary_fastball = fastballs.groupby(['pitcher', 'pitch_type']).size().reset_index(name='count')
+
+primary_fastball = primary_fastball.loc[primary_fastball.groupby('pitcher')['count'].idxmax()]
+
+avg_fastball_stats = fastballs.groupby(['pitcher', 'pitch_type']).agg({
+    'release_speed': 'mean',
+    'pfx_x': 'mean',
+    'pfx_z': 'mean'
+}).reset_index()
+
+primary_fastball = primary_fastball.merge(avg_fastball_stats, on=['pitcher', 'pitch_type'], how='left')
+
+df = df.merge(primary_fastball[['pitcher', 'release_speed', 'pfx_x', 'pfx_z']], on='pitcher', suffixes=('', '_primary'))
+
+df['diff_release_speed'] = df['release_speed'] - df['release_speed_primary']
+
+df['diff_pfx_x'] = df['adjusted_pfx_x'] - np.where(df['p_throws'] == 'L', -df['pfx_x_primary'], df['pfx_x_primary'])
+
+df['diff_pfx_z'] = df['pfx_z'] - df['pfx_z_primary']
+
+features = df[['release_speed', 'adjusted_release_pos_x', 'release_pos_z', 'adjusted_pfx_x', 'pfx_z', 'release_spin_rate', 'release_extension', 'adjusted_spin_axis','diff_release_speed', 'diff_pfx_x', 'diff_pfx_z']]
+
+target = df['avg_run_value']
+
+X_train, X_test, y_train, y_test = train_test_split(features, target, test_size=0.2, random_state=42)
+
+space = {
+    'max_depth': hp.choice('max_depth', range(3, 10)),
+    'learning_rate': hp.uniform('learning_rate', 0.01, 0.2),
+    'n_estimators': hp.choice('n_estimators', range(50, 300)),
+    'subsample': hp.uniform('subsample', 0.7, 1.0)
+}
+
+def objective(params):
+    model = xgb.XGBRegressor(
+        objective='reg:squarederror',
+        n_estimators=int(params['n_estimators']),
+        learning_rate=params['learning_rate'],
+        max_depth=params['max_depth'],
+        subsample=params['subsample'],
+        random_state=42
+    )
+    model.fit(X_train, y_train)
+    y_pred = model.predict(X_test)
+    rmse = mean_squared_error(y_test, y_pred, squared=False)
+    return {'loss': rmse, 'status': STATUS_OK}
+
+trials = Trials()
+
+best = fmin(fn=objective, space=space, algo=tpe.suggest, max_evals=100, trials=trials)
+
+print("Best hyperparameters:", best)
+
+# insert best hyperparameters in place of "x"
+model = xgb.XGBRegressor(objective='reg:squarederror', n_estimators=x, learning_rate=x, max_depth=x, subsample=x)
+
+model.fit(X_train, y_train)
+
+y_pred = model.predict(X_test)
+
+rmse = mean_squared_error(y_test, y_pred, squared=False)
+
+print(f"Root Mean Squared Error: {rmse}")
+
+xgb.plot_importance(model)
+
+plt.title('Feature Importance')
+
+plt.show()
+
+model_full = xgb.XGBRegressor(objective='reg:squarederror', n_estimators=x, learning_rate=x, max_depth=x, subsample=x)
+
+model_full.fit(features, target)
+
+df['y_pred'] = model_full.predict(features)
+
+grouped_pt = df.groupby(['pitcher', 'pitch_type', 'game_year']).agg(
+    total_predicted_rv=('y_pred', 'sum'),
+    sample_size=('y_pred', 'size')
+).reset_index()
+
+grouped_p = df.groupby(['pitcher', 'game_year']).agg(
+    total_predicted_rv=('y_pred', 'sum'),
+    sample_size=('y_pred', 'size')
+).reset_index()
+
+grouped_pt['RV/100'] = (grouped_pt['total_predicted_rv'] / grouped_pt['sample_size']) * 100
+
+grouped_p['RV/100'] = (grouped_p['total_predicted_rv'] / grouped_p['sample_size']) * 100
+
+# Scale RV/100 values relative to the average pitch thrown in a given season
